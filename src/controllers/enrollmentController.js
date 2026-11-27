@@ -6,7 +6,6 @@ function timeToMinutes(t) {
     return (parts[0] || 0) * 60 + (parts[1] || 0);
 }
 
-// Murid mendaftar ke salah satu jadwal les (dengan pengecekan bentrok hari & jam)
 export async function enrollSchedule(req, res) {
     const student_id = req.user.user_id;
     const { schedule_id, force_enroll } = req.body;
@@ -16,7 +15,6 @@ export async function enrollSchedule(req, res) {
             return res.status(400).json({ message: 'schedule_id wajib diisi.' });
         }
 
-        // Ambil detail jadwal target
         const [schedules] = await db.execute(
             `SELECT s.schedule_id, s.day_of_week, s.start_time, s.end_time, c.subject_name, c.price 
              FROM schedules s 
@@ -30,7 +28,6 @@ export async function enrollSchedule(req, res) {
 
         const target = schedules[0];
 
-        // Cek duplikasi pendaftaran
         const [existing] = await db.execute(
             'SELECT enrollment_id FROM enrollments WHERE student_id = ? AND schedule_id = ?',
             [student_id, schedule_id]
@@ -39,7 +36,6 @@ export async function enrollSchedule(req, res) {
             return res.status(400).json({ message: 'Kamu sudah terdaftar di jadwal les ini.' });
         }
 
-        // Cek bentrok jadwal di hari yang sama & jam bertabrakan
         const [mySchedules] = await db.execute(
             `SELECT s.schedule_id, s.day_of_week, s.start_time, s.end_time, c.subject_name
              FROM enrollments e
@@ -80,7 +76,6 @@ export async function enrollSchedule(req, res) {
     }
 }
 
-// Murid membatalkan / berhenti mengikuti les
 export async function unenrollSchedule(req, res) {
     const student_id = req.user.user_id;
     const { scheduleId } = req.params;
@@ -105,7 +100,6 @@ export async function unenrollSchedule(req, res) {
     }
 }
 
-// Katalog semua jadwal yang tersedia (untuk dipilih murid) + status apakah sudah diambil & detail kelas
 export async function getAvailableSchedules(req, res) {
     const student_id = req.user.user_id;
     try {

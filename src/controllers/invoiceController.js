@@ -1,5 +1,12 @@
+import crypto from 'crypto';
 import db from '../config/db.js';
 import cloudinary from '../config/cloudinary.js';
+import { snap } from '../config/midtrans.js';
+
+function extractInvoiceIdFromOrderId(orderId) {
+    const match = String(orderId || '').match(/^PRIVATKU-INV-(\d+)-/);
+    return match ? Number(match[1]) : null;
+}
 
 export async function createInvoice(req, res) {
     const { student_id, amount, due_date, payment_gateway_url } = req.body;
@@ -15,7 +22,6 @@ export async function createInvoice(req, res) {
         );
         res.status(201).json({ message: 'Tagihan SPP berhasil diterbitkan.', invoice_id: result.insertId });
     } catch (error) {
-        // Fallback jika kolom status belum ada di tabel invoices lama
         if (error.code === 'ER_BAD_FIELD_ERROR') {
             try {
                 const [fallback] = await db.execute(
@@ -71,14 +77,23 @@ export async function getInvoices(req, res) {
     }
 }
 
-// Endpoint Simulasi / Dummy Midtrans Snap Token & VA Generator
-export async function createMidtransDummyTransaction(req, res) {
+export async function createMidtransTransaction(req, res) {
     const { invoiceId } = req.params;
-    const { payment_channel } = req.body; // 'bca_va', 'gopay', 'qris', 'bni_va', 'mandiri_va'
+    const { payment_channel } = req.body || {};
     const { user_id, role } = req.user;
 
     try {
-        const [rows] = await db.execute('SELECT * FROM invoices WHERE invoice_id = ?', [invoiceId]);
+        if (!process.env.MIDTRANS_SERVER_KEY) {
+            return res.status(500).json({ message: 'MIDTRANS_SERVER_KEY belum dikonfigurasi di environment.' });
+        }
+
+        const [rows] = await db.execute(
+            `SELECT i.*, u.name AS student_name, u.email AS student_email, u.phone_number
+             FROM invoices i
+             LEFT JOIN users u ON i.student_id = u.user_id
+             WHERE i.invoice_id = ?`,
+            [invoiceId]
+        );
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Tagihan tidak ditemukan.' });
         }
@@ -88,33 +103,175 @@ export async function createMidtransDummyTransaction(req, res) {
             return res.status(403).json({ message: 'Akses ditolak.' });
         }
 
-        const channel = payment_channel || 'bca_va';
+        if (invoice.status === 'lunas') {
+            return res.status(400).json({ message: 'Tagihan ini sudah lunas.' });
+        }
+
+        const grossAmount = Math.round(Number(invoice.amount));
+        if (!Number.isFinite(grossAmount) || grossAmount <= 0) {
+            return res.status(400).json({ message: 'Nominal tagihan tidak valid.' });
+        }
+
         const orderId = `PRIVATKU-INV-${invoiceId}-${Date.now()}`;
-        const dummySnapToken = `snap-sandbox-${Math.random().toString(36).substring(2, 12)}-${invoiceId}`;
-        const dummyVaMap = {
-            bca_va: `88010${String(invoice.student_id).padStart(4, '0')}${String(invoiceId).padStart(4, '0')}`,
-            bni_va: `98810${String(invoice.student_id).padStart(4, '0')}${String(invoiceId).padStart(4, '0')}`,
-            mandiri_va: `70012${String(invoice.student_id).padStart(4, '0')}${String(invoiceId).padStart(4, '0')}`,
-            gopay: 'QRIS / GoPay Instant Sandbox',
-            qris: 'QRIS All E-Wallet Sandbox'
+
+        const channelToEnabledPayments = {
+            gopay: ['gopay'],
+            qris: ['qris', 'gopay'],
+            bca_va: ['bca_va'],
+            bni_va: ['bni_va'],
+            mandiri_va: ['echannel'],
+            bri_va: ['bri_va']
         };
 
+        const parameter = {
+            transaction_details: {
+                order_id: orderId,
+                gross_amount: grossAmount
+            },
+            item_details: [
+                {
+                    id: `INV-${invoiceId}`,
+                    price: grossAmount,
+                    quantity: 1,
+                    name: `Tagihan SPP #${invoiceId}`.slice(0, 50)
+                }
+            ],
+            customer_details: {
+                first_name: invoice.student_name || 'Murid Privatku',
+                email: invoice.student_email || 'murid@privatku.local',
+                phone: invoice.phone_number || undefined
+            }
+        };
+
+        if (payment_channel && channelToEnabledPayments[payment_channel]) {
+            parameter.enabled_payments = channelToEnabledPayments[payment_channel];
+        }
+
+        const transaction = await snap.createTransaction(parameter);
+
+        try {
+            await db.execute(
+                `UPDATE invoices 
+                 SET payment_gateway_url = ? 
+                 WHERE invoice_id = ?`,
+                [transaction.redirect_url, invoiceId]
+            );
+        } catch (dbErr) {
+            if (dbErr.code !== 'ER_BAD_FIELD_ERROR') {
+                throw dbErr;
+            }
+        }
+
         res.json({
-            message: 'Transaksi Payment Gateway (Midtrans Sandbox Dummy) siap.',
+            message: 'Transaksi Midtrans Snap berhasil dibuat.',
             order_id: orderId,
-            snap_token: dummySnapToken,
-            redirect_url: `https://app.sandbox.midtrans.com/snap/v4/redirection/${dummySnapToken}`,
-            payment_channel: channel,
-            va_number: dummyVaMap[channel] || dummyVaMap.bca_va,
-            gross_amount: Number(invoice.amount),
-            expiry_minutes: 60
+            snap_token: transaction.token,
+            redirect_url: transaction.redirect_url,
+            payment_gateway_url: transaction.redirect_url,
+            gross_amount: grossAmount
         });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 }
 
-// Murid mengajukan konfirmasi pembayaran (upload bukti transfer gambar base64 langsung ke Cloudinary)
+export async function handleMidtransWebhook(req, res) {
+    try {
+        const notification = req.body || {};
+        const {
+            order_id,
+            status_code,
+            gross_amount,
+            signature_key,
+            transaction_status,
+            fraud_status,
+            payment_type
+        } = notification;
+
+        if (!order_id || !status_code || !gross_amount || !signature_key) {
+            return res.status(400).json({ message: 'Payload notifikasi Midtrans tidak lengkap.' });
+        }
+
+        const serverKey = process.env.MIDTRANS_SERVER_KEY || '';
+        const expectedSignature = crypto
+            .createHash('sha512')
+            .update(`${order_id}${status_code}${gross_amount}${serverKey}`)
+            .digest('hex');
+
+        if (signature_key !== expectedSignature) {
+            return res.status(401).json({ message: 'Signature key Midtrans tidak valid.' });
+        }
+
+        const invoiceId = extractInvoiceIdFromOrderId(order_id);
+        if (!invoiceId) {
+            return res.json({ message: 'Order ID diabaikan (bukan format invoice Privatku).' });
+        }
+
+        const [rows] = await db.execute('SELECT * FROM invoices WHERE invoice_id = ?', [invoiceId]);
+        if (rows.length === 0) {
+            return res.status(404).json({ message: 'Tagihan tidak ditemukan.' });
+        }
+
+        let newStatus = null;
+        let setPaidAt = false;
+
+        if (transaction_status === 'capture') {
+            if (fraud_status === 'accept' || !fraud_status) {
+                newStatus = 'lunas';
+                setPaidAt = true;
+            } else if (fraud_status === 'challenge') {
+                newStatus = 'menunggu_konfirmasi';
+            }
+        } else if (transaction_status === 'settlement') {
+            newStatus = 'lunas';
+            setPaidAt = true;
+        } else if (transaction_status === 'pending') {
+            newStatus = 'menunggu_konfirmasi';
+        } else if (['deny', 'cancel', 'expire'].includes(transaction_status)) {
+            newStatus = 'ditolak';
+        }
+
+        if (newStatus) {
+            const methodValue = payment_type || 'midtrans';
+            const noteValue = `Midtrans (${methodValue}) - ${transaction_status} [${order_id}]`;
+
+            try {
+                await db.execute(
+                    `UPDATE invoices
+                     SET status = ?,
+                         payment_method = ?,
+                         payment_note = ?,
+                         paid_at = ${setPaidAt ? 'NOW()' : 'paid_at'}
+                     WHERE invoice_id = ?`,
+                    [newStatus, methodValue, noteValue, invoiceId]
+                );
+            } catch (err) {
+                if (err.code === 'ER_BAD_FIELD_ERROR') {
+                    await db.execute(
+                        `UPDATE invoices
+                         SET status = ?,
+                             payment_note = ?,
+                             paid_at = ${setPaidAt ? 'NOW()' : 'paid_at'}
+                         WHERE invoice_id = ?`,
+                        [newStatus, noteValue, invoiceId]
+                    );
+                } else {
+                    throw err;
+                }
+            }
+        }
+
+        return res.json({
+            message: 'Webhook Midtrans diproses.',
+            invoice_id: invoiceId,
+            transaction_status,
+            status: newStatus
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+}
+
 export async function submitPaymentConfirmation(req, res) {
     const { invoiceId } = req.params;
     const { payment_note, payment_method, proof_image_base64 } = req.body;
@@ -168,7 +325,6 @@ export async function submitPaymentConfirmation(req, res) {
                 [noteText, payment_method || 'Midtrans Sandbox', savedProofUrl, invoiceId]
             );
         } catch (err) {
-            // Fallback apabila kolom payment_method / payment_proof_url belum ada
             if (err.code === 'ER_BAD_FIELD_ERROR') {
                 const noteWithProof = savedProofUrl ? `${noteText} | Bukti: ${savedProofUrl}` : noteText;
                 await db.execute(
@@ -194,10 +350,9 @@ export async function submitPaymentConfirmation(req, res) {
     }
 }
 
-// Admin menyetujui (lunas) atau menolak (ditolak) pembayaran murid
 export async function reviewPaymentConfirmation(req, res) {
     const { invoiceId } = req.params;
-    const { action } = req.body; // 'lunas' atau 'ditolak'
+    const { action } = req.body; 
 
     try {
         if (!['lunas', 'ditolak'].includes(action)) {

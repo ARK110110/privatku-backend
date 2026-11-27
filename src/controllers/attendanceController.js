@@ -4,7 +4,6 @@ function generateFiveDigitCode() {
     return String(Math.floor(10000 + Math.random() * 90000));
 }
 
-// Tentor membuka sesi absensi & men-generate kode verifikasi 5 digit
 export async function openAttendanceSession(req, res) {
     const { schedule_id } = req.body;
     const { user_id, role } = req.user;
@@ -25,7 +24,6 @@ export async function openAttendanceSession(req, res) {
             return res.status(403).json({ message: 'Anda bukan tentor pengampu jadwal ini.' });
         }
 
-        // Tutup sesi lama yang masih terbuka pada jadwal ini agar hanya ada 1 sesi aktif
         await db.execute(
             'UPDATE attendance_sessions SET is_open = 0, closed_at = NOW() WHERE schedule_id = ? AND is_open = 1',
             [schedule_id]
@@ -50,7 +48,6 @@ export async function openAttendanceSession(req, res) {
     }
 }
 
-// Tentor menutup sesi absensi aktif
 export async function closeAttendanceSession(req, res) {
     const { schedule_id } = req.body;
     const { user_id, role } = req.user;
@@ -86,7 +83,6 @@ export async function closeAttendanceSession(req, res) {
     }
 }
 
-// Cek status sesi absensi aktif untuk jadwal tertentu (digunakan murid)
 export async function getActiveSessionStatus(req, res) {
     const { scheduleId } = req.params;
     try {
@@ -152,8 +148,6 @@ export async function getAttendances(req, res) {
     }
 }
 
-// Murid melakukan absensi (wajib sesi aktif, kode 5 digit valid, dan lokasi latitude/longitude)
-// atau Tentor/Admin mencatat izin/sakit/alpa murid
 export async function createAttendance(req, res) {
     const { role, user_id } = req.user;
     const { schedule_id, student_id, status, notes, verification_code, latitude, longitude } = req.body;
@@ -163,11 +157,9 @@ export async function createAttendance(req, res) {
             return res.status(400).json({ message: 'schedule_id wajib dipilih.' });
         }
 
-        // Alur Murid (Scan QR / Kode 5 Digit)
         if (role === 'murid') {
             const targetStudentId = user_id;
 
-            // 1. Pastikan murid terdaftar pada jadwal tersebut
             const [enrolled] = await db.execute(
                 'SELECT * FROM enrollments WHERE student_id = ? AND schedule_id = ?',
                 [targetStudentId, schedule_id]
@@ -176,7 +168,6 @@ export async function createAttendance(req, res) {
                 return res.status(403).json({ message: 'Anda belum terdaftar pada kelas/les ini.' });
             }
 
-            // 2. Pastikan sesi absensi sedang dibuka oleh tentor
             const [sessions] = await db.execute(
                 `SELECT * FROM attendance_sessions
                  WHERE schedule_id = ? AND is_open = 1
@@ -189,7 +180,6 @@ export async function createAttendance(req, res) {
                 });
             }
 
-            // 3. Validasi kode verifikasi 5 digit
             const cleanCode = String(verification_code || '').trim();
             if (!/^\d{5}$/.test(cleanCode)) {
                 return res.status(400).json({
@@ -202,7 +192,6 @@ export async function createAttendance(req, res) {
                 });
             }
 
-            // 4. Validasi lokasi (latitude & longitude)
             if (latitude === undefined || latitude === null || longitude === undefined || longitude === null) {
                 return res.status(400).json({
                     message: 'Lokasi perangkat (latitude & longitude) wajib aktif untuk absensi.'
@@ -225,7 +214,6 @@ export async function createAttendance(req, res) {
             });
         }
 
-        // Alur Tentor / Admin mencatat Izin / Sakit / Alpa
         if (!student_id) {
             return res.status(400).json({ message: 'student_id wajib dipilih.' });
         }
