@@ -1,12 +1,5 @@
 import db from '../config/db.js';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const uploadDir = path.join(__dirname, '..', '..', 'uploads', 'payments');
-fs.mkdirSync(uploadDir, { recursive: true });
+import cloudinary from '../config/cloudinary.js';
 
 export async function createInvoice(req, res) {
     const { student_id, amount, due_date, payment_gateway_url } = req.body;
@@ -61,13 +54,17 @@ export async function getInvoices(req, res) {
         query += ' ORDER BY i.due_date DESC, i.invoice_id DESC';
 
         const [rows] = await db.execute(query, params);
-        const normalized = rows.map((row) => ({
-            ...row,
-            status: row.status || 'belum_bayar',
-            payment_note: row.payment_note || '',
-            payment_method: row.payment_method || '',
-            proof_image_url: row.proof_image_url || ''
-        }));
+        const normalized = rows.map((row) => {
+            const proofUrl = row.payment_proof_url || row.proof_image_url || '';
+            return {
+                ...row,
+                status: row.status || 'belum_bayar',
+                payment_note: row.payment_note || '',
+                payment_method: row.payment_method || '',
+                payment_proof_url: proofUrl,
+                proof_image_url: proofUrl
+            };
+        });
         res.json(normalized);
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -117,10 +114,10 @@ export async function createMidtransDummyTransaction(req, res) {
     }
 }
 
-// Murid mengajukan konfirmasi pembayaran (mendukung bukti transfer gambar base64 + metode gateway)
+// Murid mengajukan konfirmasi pembayaran (upload bukti transfer gambar base64 langsung ke Cloudinary)
 export async function submitPaymentConfirmation(req, res) {
     const { invoiceId } = req.params;
-    const { payment_note, payment_method, proof_image_base64, proof_filename } = req.body;
+    const { payment_note, payment_method, proof_image_base64 } = req.body;
     const { user_id, role } = req.user;
 
     try {
@@ -140,13 +137,18 @@ export async function submitPaymentConfirmation(req, res) {
 
         let savedProofUrl = null;
         if (proof_image_base64 && String(proof_image_base64).trim() !== '') {
-            const rawBase64 = String(proof_image_base64).replace(/^data:image\/\w+;base64,/, '');
-            const extMatch = String(proof_filename || 'bukti.jpg').match(/\.(png|jpg|jpeg|webp)$/i);
-            const ext = extMatch ? extMatch[0].toLowerCase() : '.jpg';
-            const filename = `inv_${invoiceId}_${Date.now()}${ext}`;
-            const fullPath = path.join(uploadDir, filename);
-            fs.writeFileSync(fullPath, Buffer.from(rawBase64, 'base64'));
-            savedProofUrl = `/uploads/payments/${filename}`;
+            const rawStr = String(proof_image_base64).trim();
+            const dataUri = rawStr.startsWith('data:image/')
+                ? rawStr
+                : `data:image/jpeg;base64,${rawStr}`;
+
+            const uploadResult = await cloudinary.uploader.upload(dataUri, {
+                folder: 'privatku/payments',
+                public_id: `inv_${invoiceId}_${Date.now()}`,
+                resource_type: 'image'
+            });
+
+            savedProofUrl = uploadResult.secure_url;
         }
 
         const methodLabel = payment_method ? `[${payment_method}] ` : '';
@@ -161,12 +163,12 @@ export async function submitPaymentConfirmation(req, res) {
                  SET status = 'menunggu_konfirmasi', 
                      payment_note = ?, 
                      payment_method = ?, 
-                     proof_image_url = COALESCE(?, proof_image_url)
+                     payment_proof_url = COALESCE(?, payment_proof_url)
                  WHERE invoice_id = ?`,
                 [noteText, payment_method || 'Midtrans Sandbox', savedProofUrl, invoiceId]
             );
         } catch (err) {
-            // Fallback apabila kolom payment_method / proof_image_url belum ditambahkan via ALTER TABLE
+            // Fallback apabila kolom payment_method / payment_proof_url belum ada
             if (err.code === 'ER_BAD_FIELD_ERROR') {
                 const noteWithProof = savedProofUrl ? `${noteText} | Bukti: ${savedProofUrl}` : noteText;
                 await db.execute(
@@ -184,6 +186,7 @@ export async function submitPaymentConfirmation(req, res) {
             message: 'Pembayaran & bukti transfer berhasil dikirim. Menunggu konfirmasi Admin.',
             invoice_id: Number(invoiceId),
             status: 'menunggu_konfirmasi',
+            payment_proof_url: savedProofUrl,
             proof_image_url: savedProofUrl
         });
     } catch (error) {
