@@ -33,7 +33,7 @@ app.get('/', (req, res) => {
 
 // Menjalankan Server saat lokal; Vercel Serverless menggunakan export default app
 if (process.env.NODE_ENV !== 'production') {
-    const PORT = process.env.PORT || 5000;
+    const PORT = process.env.PORT || 6767;
     app.listen(PORT, () => {
         console.log(`Server berjalan di port ${PORT}`);
     });
